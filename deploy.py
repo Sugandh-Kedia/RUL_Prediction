@@ -24,15 +24,14 @@ st.title("🔧 Predict RUL from Manual Input")
 
 st.subheader("Enter Feature Values")
 
-# Features
-features = ["cycle", "ambient_temperature", "capacity", "voltage_measured", 
-            "current_measured", "temperature_measured", "current_load", 
-            "voltage_load", "time"]
+# Features (without 'time')
+features = ["cycle", "ambient_temperature", "capacity", "voltage_measured",
+            "current_measured", "temperature_measured", "current_load",
+            "voltage_load"]
 
 # Build manual input for last SEQUENCE_LENGTH time steps
 manual_input = []
 for t in range(SEQUENCE_LENGTH):
-    # st.markdown(f"#### ⏱ Time Step {t + 1}")
     step = []
     for feat in features:
         value = st.number_input(f"{feat} (t={t + 1})", key=f"{feat}_{t}")
@@ -43,8 +42,8 @@ for t in range(SEQUENCE_LENGTH):
 def predict_rul_manual(input_sequence, lstm_model, svr_model, scaler, sequence_length, weight_lstm, weight_svr):
     scaled_input = scaler.transform(input_sequence)
 
-    # Reshape for LSTM: (1, 9, 1)
-    sequence = np.array(scaled_input).reshape(1, 9, 1)
+    # Reshape for LSTM: (1, 8, 1)
+    sequence = np.array(scaled_input).reshape(1, len(features), 1)
 
     lstm_pred = lstm_model.predict(sequence).flatten()[0]
     svr_pred = svr_model.predict([scaled_input[-1]])[0]
@@ -52,11 +51,9 @@ def predict_rul_manual(input_sequence, lstm_model, svr_model, scaler, sequence_l
     final_pred = weight_lstm * lstm_pred + weight_svr * svr_pred
     return final_pred
 
-
 # --- Predict Button ---
 if st.button("🔍 Predict RUL"):
     try:
-        # Flatten input to count non-zero values
         non_zero_count = np.count_nonzero(manual_input)
 
         if non_zero_count < 2:
@@ -66,4 +63,3 @@ if st.button("🔍 Predict RUL"):
             st.success(f"📉 Estimated RUL: **{prediction:.2f}**")
     except Exception as e:
         st.error(f"❌ Error: {e}")
-
