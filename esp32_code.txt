@@ -1,0 +1,215 @@
+// ESP32 Real-Time SoC and RUL Updater with AJAX
+// Continuous Time Increment, Sensor Reading, FastAPI POST, and Live Web Dashboard
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+const char* ssid = "OnePlus";
+const char* password = "12345678";
+const char* serverName = "http://192.168.38.223:8000/predict";
+
+#define VOLTAGE_SENSOR_PIN 34
+#define CURRENT_SENSOR_PIN 35
+#define LOAD_VOLTAGE_SENSOR_PIN 32
+#define LOAD_CURRENT_SENSOR_PIN 33
+#define NTC_THERMISTOR_PIN 25
+
+WebServer server(80);
+
+unsigned long lastUpdateTime = 0;
+unsigned long updateInterval = 2000; // 2 seconds update interval
+
+float latestSOC = 0;
+String batteryHealthStatus = "Unknown";
+float batteryVoltage = 0;
+float batteryTemperature = 0;
+float batteryCurrent = 0;
+float loadVoltage = 0;
+float loadCurrent = 0;
+
+int cycle = 0;
+float ambientTemperature = 0;
+float elapsedTime = 0;
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/submit", HTTP_POST, handleFormSubmit);
+  server.on("/data", HTTP_GET, sendLiveData);
+
+  server.begin();
+  Serial.println("Server started.");
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long currentTime = millis();
+  if (elapsedTime > 0 && currentTime - lastUpdateTime >= updateInterval) {
+    lastUpdateTime = currentTime;
+    elapsedTime += 2;
+
+    batteryVoltage = readVoltage(VOLTAGE_SENSOR_PIN);
+    batteryCurrent = readCurrent(CURRENT_SENSOR_PIN);
+    loadVoltage = readACVoltage(LOAD_VOLTAGE_SENSOR_PIN);
+    loadCurrent = readACCurrent(LOAD_CURRENT_SENSOR_PIN);
+    batteryTemperature = readNTCTemperature(NTC_THERMISTOR_PIN);
+
+    latestSOC = estimateSOC(batteryVoltage);
+    batteryHealthStatus = checkBatteryHealth(batteryVoltage, batteryTemperature);
+
+    postToFastAPI();
+  }
+}
+
+void handleRoot() {
+  String html = "<html><head><script>"
+                "function fetchData(){ fetch('/data').then(response => response.json()).then(data => {"
+                "document.getElementById('soc').innerText = data.soc.toFixed(2) + '%';"
+                "document.getElementById('time').innerText = data.time.toFixed(0) + ' s';"
+                "document.getElementById('health').innerText = data.health;"
+                "});}"
+                "setInterval(fetchData, 2000);"
+                "</script></head><body><h2>Enter Initial Parameters</h2>"
+                "<form action='/submit' method='POST'>"
+                "Cycle: <input type='text' name='cycle'><br><br>"
+                "Ambient Temperature (°C): <input type='text' name='ambientTemperature'><br><br>"
+                "Initial Time (s): <input type='text' name='timeInput'><br><br>"
+                "<input type='submit' value='Start Monitoring'>"
+                "</form><br><h2>Real-Time Battery SOC: <span id='soc'>0</span></h2>"
+                "<h3>Elapsed Time: <span id='time'>0</span></h3>"
+                "<h3>Battery Health Status: <span id='health'>Unknown</span></h3>"
+                "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleFormSubmit() {
+  if (server.hasArg("cycle") && server.hasArg("ambientTemperature") && server.hasArg("timeInput")) {
+    cycle = server.arg("cycle").toInt();
+    ambientTemperature = server.arg("ambientTemperature").toFloat();
+    elapsedTime = server.arg("timeInput").toFloat();
+
+    lastUpdateTime = millis();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  } else {
+    server.send(400, "text/plain", "Invalid submission.");
+  }
+}
+
+void sendLiveData() {
+  String json = "{";
+  json += "\"soc\": " + String(latestSOC, 2) + ", ";
+  json += "\"time\": " + String(elapsedTime, 0) + ", ";
+  json += "\"health\": \"" + batteryHealthStatus + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void postToFastAPI() {
+  DynamicJsonDocument doc(512);
+  doc["cycle"] = cycle;
+  doc["ambient_temperature"] = ambientTemperature;
+  doc["capacity"] = latestSOC;
+  doc["voltage_measured"] = batteryVoltage;
+  doc["current_measured"] = batteryCurrent;
+  doc["temperature_measured"] = batteryTemperature;
+  doc["current_load"] = loadCurrent;
+  doc["voltage_load"] = loadVoltage;
+  doc["time"] = elapsedTime;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  HTTPClient http;
+  http.begin(serverName);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpResponseCode = http.POST(requestBody);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
+  } else {
+    Serial.println("Error sending data");
+  }
+  http.end();
+}
+
+float readVoltage(int pin) {
+  int adcValue = analogRead(pin);
+  float voltage = (adcValue / 4095.0) * 3.3;
+  return voltage * 20.0;
+}
+
+float readCurrent(int pin) {
+  int adcValue = analogRead(pin);
+  float voltage = (adcValue / 4095.0) * 3.3;
+  float offset = 2.5;
+  float sensitivity = 0.040;
+  return (voltage - offset) / sensitivity;
+}
+
+float readNTCTemperature(int pin) {
+  int adcValue = analogRead(pin);
+  float voltage = (adcValue / 4095.0) * 3.3;
+  float resistance = (10000 * voltage) / (3.3 - voltage);
+  return 1 / (0.001129148 + (0.000234125 * log(resistance)) + (0.0000000876741 * pow(log(resistance), 3))) - 273.15;
+}
+
+float readACVoltage(int pin) {
+  float maxValue = 0;
+  float minValue = 4095;
+  unsigned long start_time = millis();
+  while (millis() - start_time < 1000) {
+    int adcValue = analogRead(pin);
+    if (adcValue > maxValue) maxValue = adcValue;
+    if (adcValue < minValue) minValue = adcValue;
+  }
+  float peakVoltage = ((maxValue - minValue) / 2.0) * (3.3 / 4095.0);
+  float rmsVoltage = peakVoltage / sqrt(2);
+  return rmsVoltage * 220.0 / 0.312;
+}
+
+float readACCurrent(int pin) {
+  float maxValue = 0;
+  float minValue = 4095;
+  unsigned long start_time = millis();
+  while (millis() - start_time < 1000) {
+    int adcValue = analogRead(pin);
+    if (adcValue > maxValue) maxValue = adcValue;
+    if (adcValue < minValue) minValue = adcValue;
+  }
+  float peakVoltage = ((maxValue - minValue) / 2.0) * (3.3 / 4095.0);
+  float rmsVoltage = peakVoltage / sqrt(2);
+  float burdenResistor = 62;
+  return (rmsVoltage / burdenResistor) * 100.0;
+}
+
+float estimateSOC(float voltage) {
+  float Vmax = 53.5;
+  float Vmin = 46.4;
+  if (voltage >= Vmax) return 100.0;
+  else if (voltage <= Vmin) return 0.0;
+  else return ((voltage - Vmin) / (Vmax - Vmin)) * 100.0;
+}
+
+String checkBatteryHealth(float voltage, float temperature) {
+  if (voltage > 54.0) return "Overvoltage! Immediate action required.";
+  else if (voltage < 46.0) return "Undervoltage! Battery deeply discharged.";
+  else if (temperature > 60.0) return "Overtemperature! Risk of thermal runaway.";
+  else return "Battery operating normally.";
+}
