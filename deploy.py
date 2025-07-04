@@ -1,69 +1,93 @@
-import streamlit as st
+from fastapi import FastAPI
+from pydantic import BaseModel
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import load_model
 import joblib
+from tensorflow.keras.models import load_model
+import pandas as pd
+import os
 
-# --- Load Models and Scalers ---
-@st.cache_resource
-def load_all_models():
-    lstm_model = load_model("ltm_model.h5")
-    svr_model = joblib.load("svr_model.pkl")
-    scaler = joblib.load("scaler.pkl")
-    return lstm_model, svr_model, scaler
+app = FastAPI()
 
-lstm_model, svr_model, scaler = load_all_models()
+# Load models and scaler
+lstm_model = load_model("ltm_model.h5")
+svr_model = joblib.load("svr_model.pkl")
+scaler = joblib.load("scaler.pkl")
 
-# --- Parameters ---
-SEQUENCE_LENGTH = 1
+# CSV file name
+CSV_FILE = "battery_data.csv"
+
+# Weighting factors
 w1_opt = 0.958091373664059
 w2_opt = 1 - w1_opt
 
-# --- Streamlit UI ---
-st.title("🔧 Predict RUL from Manual Input")
+class SensorData(BaseModel):
+    cycle: float
+    ambient_temperature: float
+    capacity: float
+    voltage_measured: float
+    current_measured: float
+    temperature_measured: float
+    current_load: float
+    voltage_load: float
+    time: float  # Elapsed time in seconds
 
-st.subheader("Enter Feature Values")
-
-# Features
-features = ["cycle", "ambient_temperature", "capacity", "voltage_measured", 
-            "current_measured", "temperature_measured", "current_load", 
-            "voltage_load", "time"]
-
-# Build manual input for last SEQUENCE_LENGTH time steps
-manual_input = []
-for t in range(SEQUENCE_LENGTH):
-    # st.markdown(f"#### ⏱ Time Step {t + 1}")
-    step = []
-    for feat in features:
-        value = st.number_input(f"{feat} (t={t + 1})", key=f"{feat}_{t}")
-        step.append(value)
-    manual_input.append(step)
-
-# --- Prediction Function ---
-def predict_rul_manual(input_sequence, lstm_model, svr_model, scaler, sequence_length, weight_lstm, weight_svr):
-    scaled_input = scaler.transform(input_sequence)
-
-    # Reshape for LSTM: (1, 9, 1)
-    sequence = np.array(scaled_input).reshape(1, 9, 1)
-
-    lstm_pred = lstm_model.predict(sequence).flatten()[0]
-    svr_pred = svr_model.predict([scaled_input[-1]])[0]
-
-    final_pred = weight_lstm * lstm_pred + weight_svr * svr_pred
-    return final_pred
-
-
-# --- Predict Button ---
-if st.button("🔍 Predict RUL"):
+@app.post("/predict")
+async def predict(data: SensorData):
     try:
-        # Flatten input to count non-zero values
-        non_zero_count = np.count_nonzero(manual_input)
+        # Prepare input for model
+        input_sequence = [[
+            data.cycle,
+            data.ambient_temperature,
+            data.capacity,
+            data.voltage_measured,
+            data.current_measured,
+            data.temperature_measured,
+            data.current_load,
+            data.voltage_load,
+            data.time
+        ]]
 
-        if non_zero_count < 2:
-            st.warning("⚠️ Please fill fields to get a valid prediction.")
-        else:
-            prediction = predict_rul_manual(manual_input, lstm_model, svr_model, scaler, SEQUENCE_LENGTH, w1_opt, w2_opt)
-            st.success(f"📉 Estimated RUL: **{prediction:.2f}**")
+        # Standardization
+        scaled_input = scaler.transform(input_sequence)
+        sequence = np.array(scaled_input).reshape(1, 9, 1)  # 9 features
+
+        lstm_pred = lstm_model.predict(sequence).flatten()[0]
+        svr_pred = svr_model.predict([scaled_input[-1]])[0]
+
+        final_pred = w1_opt * lstm_pred + w2_opt * svr_pred
+
+        # Prepare new row for CSV
+        new_row = {
+            'cycle': data.cycle,
+            'ambient_temperature': data.ambient_temperature,
+            'capacity': data.capacity,
+            'voltage_measured': data.voltage_measured,
+            'current_measured': data.current_measured,
+            'temperature_measured': data.temperature_measured,
+            'current_load': data.current_load,
+            'voltage_load': data.voltage_load,
+            'time': data.time,
+            'RUL': final_pred
+        }
+
+        # Check if CSV exists, if not create it
+        if not os.path.isfile(CSV_FILE):
+            df = pd.DataFrame(columns=[
+                'cycle', 'ambient_temperature', 'capacity', 'voltage_measured',
+                'current_measured', 'temperature_measured', 'current_load',
+                'voltage_load', 'time', 'rul'
+            ])
+            df.to_csv(CSV_FILE, index=False)
+
+        # Append to CSV safely
+        df = pd.read_csv(CSV_FILE)
+        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        df.to_csv(CSV_FILE, index=False)
+
+        print(f"Logged Data: {new_row} | Predicted RUL: {final_pred}")
+
+        return {"Estimated_RUL": final_pred}
+
     except Exception as e:
-        st.error(f"❌ Error: {e}")
-
+        print(f"Error: {str(e)}")
+        return {"error": str(e)}
